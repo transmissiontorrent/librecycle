@@ -3,8 +3,9 @@
 //
 // libtrash - cross-platform "move a file/directory to the trash" library.
 //
-// Single public entry point: libtrash::trash(). Works for files and
-// directories. No glib/Qt/GTK dependency.
+// Two entry points: libtrash::trash() moves a file or directory to the trash,
+// and libtrash::trash_available() reports whether it could. No glib/Qt/GTK
+// dependency.
 //
 //   - Linux/*BSD : FreeDesktop.org Trash specification v1.0
 //   - Windows    : IFileOperation (FOFX_RECYCLEONDELETE)
@@ -67,6 +68,32 @@ bool trash(std::string_view utf8_path, std::error_code& ec) noexcept;
 // std::filesystem::filesystem_error (carrying the path and a libtrash::errc) on
 // failure.
 void trash(std::string_view utf8_path);
+
+// Whether a trash usable for `utf8_path` exists, without moving or creating
+// anything. This is the question a UI needs answered before it offers to trash
+// something -- and it is per-path, because every platform decides per volume:
+// ask about the item (or the directory) you actually intend to trash.
+//
+//     if (libtrash::trash_available(path)) { /* offer "Move to Trash" */ }
+//
+// Returns true when trash() would have somewhere to put the item, and false for
+// every reason it would not -- including a missing or malformed path. Nothing is
+// thrown, so a menu item can be greyed out straight from the result: "this
+// filesystem has no trash" is an answer, not an error.
+//
+// The answer is advisory in both directions. Because it creates nothing, a
+// "yes" can still be followed by a trash() that fails -- a directory that was
+// creatable a moment ago, a full disk, a race with another process. And a "no"
+// is never authority to delete the item permanently: trash() will not do that,
+// and neither should a caller without saying so in its own voice.
+bool trash_available(std::string_view utf8_path) noexcept;
+
+// As above, and on false sets `ec` to the reason: cross_device when the item's
+// filesystem offers no usable trash, unsupported when this build has no
+// backend, not_found when `utf8_path` does not exist, invalid_argument for a
+// malformed path. Only the boolean is dependable across platforms; the reason is
+// advisory, as for trash().
+bool trash_available(std::string_view utf8_path, std::error_code& ec) noexcept;
 
 } // namespace libtrash
 

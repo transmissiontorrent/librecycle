@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -313,6 +314,122 @@ bool claim_and_write_info(
     return false;
 }
 
+enum class Mode
+{
+    Create, // create the trash directories as needed -- trash()
+    Probe, // predict whether they could be created, touching nothing -- trash_available()
+};
+
+struct TrashDirs
+{
+    std::string files_dir;
+    std::string info_dir;
+    std::string original_for_info; // absolute (home trash) or topdir-relative
+};
+
+bool dir_usable(std::string const& path, Mode mode)
+{
+    return mode == Mode::Probe ? detail::dir_exists_or_creatable(path) : ensure_dir(path, 0700);
+}
+
+bool owned_dir_usable(std::string const& path, uid_t uid, Mode mode)
+{
+    return mode == Mode::Probe ? detail::owned_dir_exists_or_creatable(path, uid) :
+                                 detail::make_or_verify_owned_dir(path, uid);
+}
+
+// Pick the trash directories for `resolved`, whose filesystem is `file_dev`.
+// Both entry points share this so a probe cannot answer by a different rule
+// than the move it predicts. On failure sets `ec`.
+bool select_trash_dirs(fs::path const& resolved, dev_t file_dev, Mode mode, TrashDirs& out, std::error_code& ec)
+{
+    std::string const abs_path = resolved.string();
+
+    std::string home_trash = xdg_data_home();
+    if (home_trash.empty())
+    {
+        ec = make_error_code(errc::platform_error);
+        return false;
+    }
+    home_trash += "/Trash";
+
+    dev_t home_dev = 0;
+    bool const have_home_dev = nearest_existing_dev(home_trash, home_dev);
+
+    // Prefer the home trash when the item is on the home filesystem. If its
+    // directories cannot be created (e.g. a read-only or over-quota home),
+    // fall back to the top-directory trash on the item's own filesystem.
+    if (have_home_dev && file_dev == home_dev)
+    {
+        std::string files_dir = home_trash + "/files";
+        std::string info_dir = home_trash + "/info";
+        if (dir_usable(files_dir, mode) && dir_usable(info_dir, mode))
+        {
+            out = { std::move(files_dir), std::move(info_dir), abs_path };
+            return true;
+        }
+    }
+
+    std::string const topdir = find_mount_point(abs_path);
+    if (topdir.empty())
+    {
+        ec = make_error_code(errc::cross_device);
+        return false;
+    }
+    uid_t const uid = ::getuid();
+    std::string const uid_s = std::to_string(static_cast<unsigned long>(uid));
+
+    // Select the per-user trash directory, refusing to follow a symlink or to
+    // reuse a directory owned by someone else (a co-user's hijack attempt on a
+    // shared mount). Prefer the sticky admin trash $topdir/.Trash/$uid;
+    // otherwise fall back to $topdir/.Trash-$uid.
+    std::string const admin = topdir + "/.Trash";
+    std::string const admin_dir = admin + "/" + uid_s;
+    std::string const fallback_dir = topdir + "/.Trash-" + uid_s;
+    std::string trash_dir;
+    if (is_safe_admin_trash(admin) && owned_dir_usable(admin_dir, uid, mode))
+    {
+        trash_dir = admin_dir;
+    }
+    else if (owned_dir_usable(fallback_dir, uid, mode))
+    {
+        trash_dir = fallback_dir;
+    }
+    else
+    {
+        ec = make_error_code(errc::permission_denied);
+        return false;
+    }
+
+    std::string files_dir = trash_dir + "/files";
+    std::string info_dir = trash_dir + "/info";
+    if (!dir_usable(files_dir, mode) || !dir_usable(info_dir, mode))
+    {
+        ec = make_error_code(errc::permission_denied);
+        return false;
+    }
+
+    // For topdir trashes the recorded path is relative to the top directory.
+    out = { std::move(files_dir), std::move(info_dir), resolved.lexically_relative(topdir).string() };
+    return true;
+}
+
+// Validate `path_sv` and stat the item, yielding the resolved path and the
+// filesystem it lives on -- the inputs select_trash_dirs() needs.
+bool resolve_and_stat(std::string_view path_sv, fs::path& resolved, dev_t& file_dev, std::error_code& ec)
+{
+    if (!detail::resolve_input(path_sv, resolved, ec))
+    {
+        return false;
+    }
+    if (!lstat_dev(resolved.string(), file_dev))
+    {
+        ec = make_error_code(errc::not_found);
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 bool trash(std::string_view path_sv, std::error_code& ec) noexcept
@@ -321,92 +438,17 @@ bool trash(std::string_view path_sv, std::error_code& ec) noexcept
     try
     {
         fs::path resolved;
-        if (!detail::resolve_input(path_sv, resolved, ec))
+        dev_t file_dev = 0;
+        if (!resolve_and_stat(path_sv, resolved, file_dev, ec))
         {
             return false;
         }
         std::string const abs_path = resolved.string();
 
-        dev_t file_dev = 0;
-        if (!lstat_dev(abs_path, file_dev))
+        TrashDirs dirs;
+        if (!select_trash_dirs(resolved, file_dev, Mode::Create, dirs, ec))
         {
-            ec = make_error_code(errc::not_found);
             return false;
-        }
-
-        std::string home_trash = xdg_data_home();
-        if (home_trash.empty())
-        {
-            ec = make_error_code(errc::platform_error);
-            return false;
-        }
-        home_trash += "/Trash";
-
-        dev_t home_dev = 0;
-        bool const have_home_dev = nearest_existing_dev(home_trash, home_dev);
-
-        std::string files_dir;
-        std::string info_dir;
-        std::string original_for_info; // absolute (home trash) or topdir-relative
-
-        // Prefer the home trash when the item is on the home filesystem. If its
-        // directories cannot be created (e.g. a read-only or over-quota home),
-        // fall back to the top-directory trash on the item's own filesystem.
-        bool ready = false;
-        if (have_home_dev && file_dev == home_dev)
-        {
-            files_dir = home_trash + "/files";
-            info_dir = home_trash + "/info";
-            if (ensure_dir(files_dir, 0700) && ensure_dir(info_dir, 0700))
-            {
-                original_for_info = abs_path;
-                ready = true;
-            }
-        }
-
-        if (!ready)
-        {
-            std::string const topdir = find_mount_point(abs_path);
-            if (topdir.empty())
-            {
-                ec = make_error_code(errc::cross_device);
-                return false;
-            }
-            uid_t const uid = ::getuid();
-            std::string const uid_s = std::to_string(static_cast<unsigned long>(uid));
-
-            // Select and create the per-user trash directory, refusing to follow
-            // a symlink or reuse a directory owned by someone else (a co-user's
-            // hijack attempt on a shared mount). Prefer the sticky admin trash
-            // $topdir/.Trash/$uid; otherwise fall back to $topdir/.Trash-$uid.
-            std::string const admin = topdir + "/.Trash";
-            std::string const admin_dir = admin + "/" + uid_s;
-            std::string const fallback_dir = topdir + "/.Trash-" + uid_s;
-            std::string trash_dir;
-            if (is_safe_admin_trash(admin) && detail::make_or_verify_owned_dir(admin_dir, uid))
-            {
-                trash_dir = admin_dir;
-            }
-            else if (detail::make_or_verify_owned_dir(fallback_dir, uid))
-            {
-                trash_dir = fallback_dir;
-            }
-            else
-            {
-                ec = make_error_code(errc::permission_denied);
-                return false;
-            }
-
-            files_dir = trash_dir + "/files";
-            info_dir = trash_dir + "/info";
-            if (!ensure_dir(files_dir, 0700) || !ensure_dir(info_dir, 0700))
-            {
-                ec = make_error_code(errc::permission_denied);
-                return false;
-            }
-
-            // For topdir trashes the recorded path is relative to the top directory.
-            original_for_info = resolved.lexically_relative(topdir).string();
         }
 
         std::string base = resolved.filename().string();
@@ -416,7 +458,13 @@ bool trash(std::string_view path_sv, std::error_code& ec) noexcept
         }
         TrashName target;
         if (!claim_and_write_info(
-                files_dir, info_dir, base, percent_encode(original_for_info), deletion_date_now(), target, ec))
+                dirs.files_dir,
+                dirs.info_dir,
+                base,
+                percent_encode(dirs.original_for_info),
+                deletion_date_now(),
+                target,
+                ec))
         {
             return false;
         }
@@ -430,6 +478,28 @@ bool trash(std::string_view path_sv, std::error_code& ec) noexcept
         }
 
         return true;
+    }
+    catch (...)
+    {
+        ec = make_error_code(errc::platform_error);
+        return false;
+    }
+}
+
+bool trash_available(std::string_view path_sv, std::error_code& ec) noexcept
+{
+    ec.clear();
+    try
+    {
+        fs::path resolved;
+        dev_t file_dev = 0;
+        if (!resolve_and_stat(path_sv, resolved, file_dev, ec))
+        {
+            return false;
+        }
+
+        TrashDirs dirs;
+        return select_trash_dirs(resolved, file_dev, Mode::Probe, dirs, ec);
     }
     catch (...)
     {

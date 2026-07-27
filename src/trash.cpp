@@ -2,7 +2,8 @@
 // This file Copyright © Mnemosaic LLC.
 //
 // Platform-agnostic pieces: the trash error_category, the make_error_code
-// customization point, and the throwing trash() overload.
+// customization point, and the two overloads that are defined in terms of the
+// per-platform ones.
 
 #include "libtrash/trash.hpp"
 
@@ -63,6 +64,12 @@ void trash(std::string_view utf8_path)
     {
         throw std::filesystem::filesystem_error("libtrash::trash", std::filesystem::path(utf8_path), ec);
     }
+}
+
+bool trash_available(std::string_view utf8_path) noexcept
+{
+    std::error_code ec;
+    return trash_available(utf8_path, ec);
 }
 
 } // namespace libtrash
