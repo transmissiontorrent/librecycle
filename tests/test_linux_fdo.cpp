@@ -64,6 +64,52 @@ int main()
     fs::path const files_dir = xdg / "Trash" / "files";
     fs::path const info_dir = xdg / "Trash" / "info";
 
+    // 0) trash_available() before anything else, while the trash directories
+    //    still do not exist: it must answer yes on their behalf and create
+    //    none of them.
+    {
+        fs::path const probe = sandbox / "probe.txt";
+        {
+            std::ofstream(probe) << "p";
+        }
+
+        std::error_code pec;
+        CHECK(libtrash::trash_available(probe.string(), pec), "trash_available: yes for a file in the sandbox home");
+        CHECK(!pec, "trash_available: leaves ec clear when the answer is yes");
+        CHECK(!fs::exists(xdg / "Trash"), "trash_available: created no trash directories");
+
+        std::error_code missing;
+        CHECK(
+            !libtrash::trash_available((sandbox / "no-such-file").string(), missing)
+                && missing == libtrash::errc::not_found,
+            "trash_available: missing path -> errc::not_found");
+
+        std::error_code bad;
+        CHECK(
+            !libtrash::trash_available("", bad) && bad == libtrash::errc::invalid_argument,
+            "trash_available: empty path -> errc::invalid_argument");
+
+        // The bool-only overload: same verdicts, no error_code to declare.
+        CHECK(libtrash::trash_available(probe.string()), "trash_available(path): yes needs no error_code");
+        CHECK(
+            !libtrash::trash_available((sandbox / "no-such-file").string()),
+            "trash_available(path): a missing path is a no, not a throw");
+        CHECK(!libtrash::trash_available(""), "trash_available(path): an empty path is a no, not a throw");
+
+        // The claim the probe makes: what it says yes to, trash() can do.
+        std::error_code tec;
+        CHECK(libtrash::trash(probe.string(), tec) && !tec, "trash_available: its yes was borne out by trash()");
+
+        // Same answer once the directories it predicted are real.
+        fs::path const probe2 = sandbox / "probe2.txt";
+        {
+            std::ofstream(probe2) << "p";
+        }
+        std::error_code pec2;
+        CHECK(libtrash::trash_available(probe2.string(), pec2), "trash_available: still yes once the trash exists");
+        fs::remove(probe2);
+    }
+
     // 1) Basic file trashing (name has a space -> exercises percent-encoding).
     fs::path const victim = sandbox / "hello world.txt";
     {
@@ -208,6 +254,58 @@ int main()
         fs::create_symlink(attacker, planted);
         CHECK(!libtrash::detail::make_or_verify_owned_dir(planted, me), "guard: refuses a planted symlink");
         CHECK(fs::is_empty(attacker), "guard: nothing was written through the symlink");
+    }
+
+    // 7) The probe predicates behind trash_available(): same verdicts as the
+    //    creating helpers above, reached without creating anything.
+    {
+        fs::path const root = sandbox / "probe_root";
+        fs::create_directories(root);
+        uid_t const me = ::getuid();
+
+        CHECK(libtrash::detail::dir_exists_or_creatable(root.string()), "probe: an existing directory is usable");
+
+        CHECK(
+            libtrash::detail::dir_exists_or_creatable((root / "a" / "b").string()),
+            "probe: a missing dir below a writable parent is creatable");
+        CHECK(!fs::exists(root / "a"), "probe: predicting creation created nothing");
+
+        {
+            std::ofstream(root / "a_file") << "x";
+        }
+        CHECK(
+            !libtrash::detail::dir_exists_or_creatable((root / "a_file").string()),
+            "probe: a plain file is not a usable directory");
+
+        // access(W_OK) is advisory for root, which may write to any directory,
+        // so this case can only be asserted as a normal user.
+        if (::geteuid() != 0)
+        {
+            fs::path const locked = root / "locked";
+            fs::create_directories(locked);
+            fs::permissions(locked, fs::perms::owner_read | fs::perms::owner_exec);
+            CHECK(
+                !libtrash::detail::dir_exists_or_creatable((locked / "child").string()),
+                "probe: an unwritable parent means not creatable");
+            fs::permissions(locked, fs::perms::owner_all);
+        }
+
+        CHECK(
+            libtrash::detail::owned_dir_exists_or_creatable((root / ".Trash-1000").string(), me),
+            "probe: a missing owned dir below a writable parent is creatable");
+        CHECK(!fs::exists(root / ".Trash-1000"), "probe: predicting an owned dir created nothing");
+
+        fs::path const mine = root / ".Trash-mine";
+        fs::create_directories(mine);
+        CHECK(
+            libtrash::detail::owned_dir_exists_or_creatable(mine.string(), me),
+            "probe: accepts an existing dir we own");
+
+        std::string const planted = (root / ".Trash-evil").string();
+        fs::create_symlink(root, planted);
+        CHECK(
+            !libtrash::detail::owned_dir_exists_or_creatable(planted, me),
+            "probe: refuses a planted symlink, as the creating helper does");
     }
 
     std::error_code rmec;

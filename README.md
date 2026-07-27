@@ -14,7 +14,8 @@ if (!libtrash::trash("path/to/file-or-dir", ec))
 libtrash::trash("path/to/file-or-dir");   // throws std::filesystem::filesystem_error
 ```
 
-- **One function**, two overloads (non-throwing + throwing) mirroring `<filesystem>`.
+- **`trash()`** in non-throwing and throwing overloads, mirroring `<filesystem>`.
+- **`trash_available()`** to ask first, for a UI that should only offer trashing where it works.
 - **Files and directories**: a directory and its contents move as a single unit.
 - **Never permanently deletes**: if an item can't be trashed, the call fails and leaves it in place.
 - **No third-party dependencies**: only the platform SDK.
@@ -23,6 +24,43 @@ Backends: Linux/BSD implement the
 [FreeDesktop.org Trash specification v1.0](https://specifications.freedesktop.org/trash-spec/trashspec-1.0.html)
 directly (no glib/Qt/GTK); Windows uses `IFileOperation`; macOS uses
 `-[NSFileManager trashItemAtURL:...]`.
+
+## Asking first
+
+`trash_available()` reports whether a trash usable for a given path exists,
+without moving or creating anything — for greying out a "Move to Trash" command,
+or for telling a user which of the two things a Remove button is about to do.
+
+```cpp
+if (libtrash::trash_available("/mnt/backups"))
+    // ...offer "Move to Trash" for items under /mnt/backups
+
+std::error_code ec;                                  // ...or ask why not
+if (!libtrash::trash_available("/mnt/backups", ec))
+    std::fprintf(stderr, "%s\n", ec.message().c_str());
+```
+
+The one-argument form returns false for every reason it is not a yes and throws
+nothing, so a menu item's enabled state can come straight from the result.
+
+Pass the path you actually intend to trash, or the directory it lives in: every
+platform decides per volume, so there is no machine-wide answer. A network
+share, a volume with recycling switched off, and a home directory that has run
+out of quota all differ from the disk beside them.
+
+The answer is advisory in both directions. Because nothing is created, a `true`
+can still be followed by a `trash()` that fails — a full disk, a permission
+change, a race. And a `false` is not authority to delete permanently: `trash()`
+will never do that, so the fallback is the caller's decision to make and to say
+out loud.
+
+How each platform is asked:
+
+| Platform | Query |
+| --- | --- |
+| Linux/BSD | replays the spec's own directory selection (home trash, then `$topdir/.Trash{,-$uid}`) without creating anything |
+| macOS | `-[NSFileManager URLForDirectory:NSTrashDirectory ... appropriateForURL:create:NO]` |
+| Windows | drive type, `SHQueryRecycleBin`, and Explorer's `NoRecycleFiles` / `NukeOnDelete` settings |
 
 ## Error handling
 

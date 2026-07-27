@@ -30,6 +30,23 @@ int main()
         std::ofstream(victim) << "data";
     }
 
+    // Ask before acting: the temp directory is on a volume with a trash, so the
+    // probe must say yes and then be borne out by the trash() below.
+    std::error_code avail;
+    check(libtrash::trash_available(victim.string(), avail), "trash_available says yes for a temp file");
+    check(!avail, "trash_available leaves ec clear when the answer is yes");
+
+    std::error_code avail_missing;
+    check(
+        !libtrash::trash_available((fs::temp_directory_path() / "nope-xyz").string(), avail_missing)
+            && avail_missing == libtrash::errc::not_found,
+        "trash_available: missing path -> errc::not_found");
+
+    check(libtrash::trash_available(victim.string()), "trash_available(path): yes needs no error_code");
+    check(
+        !libtrash::trash_available((fs::temp_directory_path() / "nope-xyz").string()),
+        "trash_available(path): a missing path is a no, not a throw");
+
     std::error_code ec;
     bool const ok = libtrash::trash(victim.string(), ec);
     check(ok && !ec, "trash returns success");

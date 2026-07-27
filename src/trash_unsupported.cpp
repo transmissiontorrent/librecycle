@@ -19,7 +19,12 @@
 namespace libtrash
 {
 
-bool trash(std::string_view path, std::error_code& ec) noexcept
+namespace
+{
+
+// A malformed path is rejected as such even here, so that argument checking is
+// the one thing callers can rely on from every platform.
+bool validate_only(std::string_view path, std::error_code& ec)
 {
     ec.clear();
     if (path.empty() || path.find('\0') != std::string_view::npos || !detail::is_valid_utf8(path))
@@ -29,6 +34,18 @@ bool trash(std::string_view path, std::error_code& ec) noexcept
     }
     ec = make_error_code(errc::unsupported);
     return false;
+}
+
+} // namespace
+
+bool trash(std::string_view path, std::error_code& ec) noexcept
+{
+    return validate_only(path, ec);
+}
+
+bool trash_available(std::string_view path, std::error_code& ec) noexcept
+{
+    return validate_only(path, ec);
 }
 
 } // namespace libtrash
